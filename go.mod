@@ -1,4 +1,4 @@
-module github.com/twilight-project/ZkOracle
+module github.com/twilight-project/zkoracle-go
 
 go 1.21
 
