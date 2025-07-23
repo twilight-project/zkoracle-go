@@ -1,3 +1,4 @@
+// submitTx.go
 package main
 
 import (
@@ -7,64 +8,56 @@ import (
 	"io"
 	"log"
 	"net/http"
-	"os"
 	"path/filepath"
 	"time"
 
 	sdktypes "github.com/cosmos/cosmos-sdk/types"
+	cosmosaccount "github.com/ignite/cli/ignite/pkg/cosmosaccount"
 	"github.com/ignite/cli/ignite/pkg/cosmosclient"
 	zktypes "github.com/twilight-project/nyks/x/zkos/types"
 )
 
-func sendTransactionTransferTx(accountName string, cosmos cosmosclient.Client, data *zktypes.MsgTransferTx) (cosmosclient.Response, error) {
-	// Specify the broadcast mode (e.g., 'async' for asynchronous)
-	// broadcastMode := "async"
-	// contxt:= cosmos.Context()
-	// cotxt = contxt.WithBroadcastMode(broadcastMode)
-	// resp, err := cosmos.BroadcastTx(cotxt, accountName, data)
-	// Specify the broadcast mode (e.g., 'async' for asynchronous)
-	//txFactory := cosmos.TxFactory().WithBroadcastMode(sdktypes.BroadcastAsync)
-	fmt.Println("Broadcasting Transfer Tx")
-	for i := 0; i < 3; i++ {
-		resp, err := cosmos.BroadcastTx(accountName, data)
-		if err != nil {
-			fmt.Println("Error broadcasting transaction, retrying...", err)
-			time.Sleep(time.Second * 2) // wait for 2 seconds before retrying
-			continue
-		}
-		return resp, nil
-	}
-	return cosmosclient.Response{}, fmt.Errorf("failed to broadcast transaction after 3 attempts : ")
+// -----------------------------------------------------------------------------
+// Helpers
+// -----------------------------------------------------------------------------
 
-}
-
-func sendTransactionBurnMessage(accountName string, cosmos cosmosclient.Client, data *zktypes.MsgMintBurnTradingBtc) (cosmosclient.Response, error) {
-	resp, err := cosmos.BroadcastTx(accountName, data)
-	return resp, err
-}
 func getCosmosClient() cosmosclient.Client {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		log.Println(err)
-	}
+	homePath := filepath.Join("/home/ubuntu/.nyks")
 
-	homePath := filepath.Join(home, ".nyks")
+	cfg := sdktypes.GetConfig()
+	cfg.SetBech32PrefixForAccount("twilight", "twilight"+"pub")
 
-	cosmosOptions := []cosmosclient.Option{
+	cosmos, err := cosmosclient.New(
+		context.Background(),
 		cosmosclient.WithHome(homePath),
-	}
-
-	config := sdktypes.GetConfig()
-	config.SetBech32PrefixForAccount("twilight", "twilight"+"pub")
-
-	// create an instance of cosmosclient
-	cosmos, err := cosmosclient.New(context.Background(), cosmosOptions...)
+	)
 	if err != nil {
-		log.Println(err)
+		log.Fatalf("failed to create cosmos client: %v", err)
 	}
-
 	return cosmos
 }
+
+func broadcastWithRetry(
+	ctx context.Context,
+	client cosmosclient.Client,
+	acc cosmosaccount.Account,
+	msg sdktypes.Msg,
+) (cosmosclient.Response, error) {
+	fmt.Println("Broadcasting Transfer Tx")
+	for i := 0; i < 3; i++ {
+		resp, err := client.BroadcastTx(ctx, acc, msg)
+		if err == nil {
+			return resp, nil
+		}
+		fmt.Println("broadcast failed, retrying…", err)
+		time.Sleep(2 * time.Second)
+	}
+	return cosmosclient.Response{}, fmt.Errorf("failed to broadcast tx after 3 attempts")
+}
+
+// -----------------------------------------------------------------------------
+// Transfer‑Tx
+// -----------------------------------------------------------------------------
 
 func handleTransferTx(w http.ResponseWriter, req *http.Request) {
 	fmt.Println("Transfer Tx handler")
@@ -74,20 +67,11 @@ func handleTransferTx(w http.ResponseWriter, req *http.Request) {
 	}
 
 	var p PayloadHttpReq
-	decoder := json.NewDecoder(req.Body)
-	err := decoder.Decode(&p)
-	defer req.Body.Close()
-
-	if err != nil && err != io.EOF {
+	if err := json.NewDecoder(req.Body).Decode(&p); err != nil && err != io.EOF {
 		http.Error(w, "Error decoding JSON", http.StatusBadRequest)
 		return
 	}
-
-	if err != nil {
-		fmt.Println("Error:", err)
-		return
-	}
-
+	_ = req.Body.Close()
 	fmt.Println("Transfer Tx: ", p.Tx)
 	msg := &zktypes.MsgTransferTx{
 		TxId:            p.Txid,
@@ -96,20 +80,14 @@ func handleTransferTx(w http.ResponseWriter, req *http.Request) {
 		TxFee:           p.Fee,
 	}
 
-	cosmosClient := getCosmosClient()
+	cosmos := getCosmosClient()
+	acc, err := cosmos.Account(accountName)
+	if err != nil {
+		http.Error(w, "account not found: "+err.Error(), http.StatusBadRequest)
+		return
+	}
 
-	// Record the current time before executing the code
-	// startTime := time.Now()
-	resp, err := sendTransactionTransferTx(accountName, cosmosClient, msg)
-	// // Record the current time after executing the code
-	// endTime := time.Now()
-
-	// // Calculate the elapsed time
-	// elapsedTime := endTime.Sub(startTime)
-
-	// Print the elapsed time
-	// fmt.Printf("Elapsed time for Tx Broadcast: %v\n", elapsedTime)
-
+	resp, err := broadcastWithRetry(req.Context(), cosmos, acc, msg)
 	if err != nil {
 		fmt.Println("Error in sending transfer tx :", err)
 		w.WriteHeader(http.StatusBadRequest)
@@ -118,10 +96,14 @@ func handleTransferTx(w http.ResponseWriter, req *http.Request) {
 		fmt.Println("Transfer Tx Hash: ", resp.TxHash)
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte(`{"txHash" : "` + resp.TxHash + `"}`))
+		txCounter.Inc()
 	}
 
-	txCounter.Inc()
 }
+
+// -----------------------------------------------------------------------------
+// Burn‑Message Tx
+// -----------------------------------------------------------------------------
 
 func handleBurnMessageTx(w http.ResponseWriter, req *http.Request) {
 	if req.Method != http.MethodPost {
@@ -130,14 +112,11 @@ func handleBurnMessageTx(w http.ResponseWriter, req *http.Request) {
 	}
 
 	var p PayloadBurnReq
-	decoder := json.NewDecoder(req.Body)
-	err := decoder.Decode(&p)
-	defer req.Body.Close()
-
-	if err != nil && err != io.EOF {
+	if err := json.NewDecoder(req.Body).Decode(&p); err != nil && err != io.EOF {
 		http.Error(w, "Error decoding JSON", http.StatusBadRequest)
 		return
 	}
+	_ = req.Body.Close()
 
 	msg := &zktypes.MsgMintBurnTradingBtc{
 		MintOrBurn:      false,
@@ -147,9 +126,14 @@ func handleBurnMessageTx(w http.ResponseWriter, req *http.Request) {
 		TwilightAddress: p.TwilightAddress,
 	}
 
-	cosmosClient := getCosmosClient()
+	cosmos := getCosmosClient()
+	acc, err := cosmos.Account(accountName)
+	if err != nil {
+		http.Error(w, "account not found: "+err.Error(), http.StatusBadRequest)
+		return
+	}
 
-	resp, err := sendTransactionBurnMessage(accountName, cosmosClient, msg)
+	resp, err := cosmos.BroadcastTx(req.Context(), acc, msg)
 	if err != nil {
 		w.WriteHeader(http.StatusBadRequest)
 		w.Write([]byte(`{"error" : "` + err.Error() + `"}`))
@@ -157,9 +141,9 @@ func handleBurnMessageTx(w http.ResponseWriter, req *http.Request) {
 
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte(`{"txHash" : "` + resp.TxHash + `"}`))
+		txCounter.Inc()
 	}
 
-	txCounter.Inc()
 }
 
 func server() {
